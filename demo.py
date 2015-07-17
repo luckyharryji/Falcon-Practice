@@ -1,63 +1,100 @@
 import json
 import logging
 import uuid
-import wsgiref import simple_server
+from wsgiref import simple_server
 
 import falcon
-import request
+import requests
+
 
 class StorageEngine(object):
-    def get_things(self,marker,limit):
-        return [{'id':str(uuid.uuid4()),'color':'green'}]
 
-    def add_things(self,thing):
-        thing['id']=str(uuid.uuid4())
+    def get_things(self, marker, limit):
+        return [{'id': str(uuid.uuid4()), 'color': 'green'}]
+
+    def add_thing(self, thing):
+        thing['id'] = str(uuid.uuid4())
         return thing
 
+
 class StorageError(Exception):
+
     @staticmethod
-    def handle(ex,req,resp,params):
-        description=('sorry, could not write your thing to the dataabase')
-        raise falcon.HTTPError(falcon.HTTP_725,'Data Base Error',description)
+    def handle(ex, req, resp, params):
+        description = ('Sorry, couldn\'t write your thing to the '
+                       'database. It worked on my box.')
+
+        raise falcon.HTTPError(falcon.HTTP_725,
+                               'Database Error',
+                               description)
+
 
 class SinkAdapter(object):
+
     engines = {
         'ddg': 'https://duckduckgo.com',
         'y': 'https://search.yahoo.com/search',
     }
-    def __call__(self,req,resp,engine):
+
+    def __call__(self, req, resp, engine):
         url = self.engines[engine]
-        params = {'q':req.get_param('q',True)}
-        result = request.get(url,params=params)
-        resp.status = str(result.status_code)+' '+resp.reason
-        resp.content_type = result.handlers['content_type']
+        params = {'q': req.get_param('q', True)}
+        result = requests.get(url, params=params)
+
+        resp.status = str(result.status_code) + ' ' + result.reason
+        resp.content_type = result.headers['content-type']
         resp.body = result.text
 
-class AuthMiddleware(object):
-    def _token_is_valid(self,token,project):
-        return True
 
-    def process_request(self,req,resp):
+class AuthMiddleware(object):
+
+    def process_request(self, req, resp):
         token = req.get_header('X-Auth-Token')
         project = req.get_header('X-Project-ID')
+
         if token is None:
-            description = ('please provide auth token')
-            raise falcon.HTTPUnauthorized('Auth token required',description,href='http://docs.example.com/auth',scheme='Token; UUID'))
-        if not self._token_is_valid(token,project):
-            description = ('the token is not valid')
-            raise falcon.HTTPUnauthorized('Auth required',description,href='http://docs.example.com/auth',scheme = 'Token;UUID')
+            description = ('Please provide an auth token '
+                           'as part of the request.')
+
+            raise falcon.HTTPUnauthorized('Auth token required',
+                                          description,
+                                          href='http://docs.example.com/auth')
+
+        if not self._token_is_valid(token, project):
+            description = ('The provided auth token is not valid. '
+                           'Please request a new token and try again.')
+
+            raise falcon.HTTPUnauthorized('Authentication required',
+                                          description,
+                                          href='http://docs.example.com/auth',
+                                          scheme='Token; UUID')
+
+    def _token_is_valid(self, token, project):
+        return True  # Suuuuuure it's valid...
 
 
 class RequireJSON(object):
-    def process_request(self,req,resp):
+
+    def process_request(self, req, resp):
         if not req.client_accepts_json:
-            raise falcon.HTTPNotAcceptable('API only supports responses encodes as JSON',href='http://docs.examples.com/api/json')
-        if req.method in('POST','PUT'):
+            raise falcon.HTTPNotAcceptable(
+                'This API only supports responses encoded as JSON.',
+                href='http://docs.examples.com/api/json')
+
+        if req.method in ('POST', 'PUT'):
             if 'application/json' not in req.content_type:
-                raise falcon.HTTPUnsupportedMediaType('API only supports requests encoded as JSON',href='http://docs.examples.com/api/json')
+                raise falcon.HTTPUnsupportedMediaType(
+                    'This API only supports requests encoded as JSON.',
+                    href='http://docs.examples.com/api/json')
+
 
 class JSONTranslator(object):
-    def process_request(self,req,resp):
+
+    def process_request(self, req, resp):
+        # req.stream corresponds to the WSGI wsgi.input environ variable,
+        # and allows you to read bytes from the request body.
+        #
+        # See also: PEP 3333
         if req.content_length in (None, 0):
             # Nothing to do
             return
@@ -85,6 +122,7 @@ class JSONTranslator(object):
 
 
 def max_body(limit):
+
     def hook(req, resp, resource, params):
         length = req.content_length
         if length is not None and length > limit:
@@ -98,3 +136,75 @@ def max_body(limit):
 
 
 class ThingsResource:
+
+    def __init__(self, db):
+        self.db = db
+        self.logger = logging.getLogger('thingsapp.' + __name__)
+
+    def on_get(self, req, resp, user_id):
+        marker = req.get_param('marker') or ''
+        limit = req.get_param_as_int('limit') or 50
+
+        try:
+            result = self.db.get_things(marker, limit)
+        except Exception as ex:
+            self.logger.error(ex)
+
+            description = ('Aliens have attacked our base! We will '
+                           'be back as soon as we fight them off. '
+                           'We appreciate your patience.')
+
+            raise falcon.HTTPServiceUnavailable(
+                'Service Outage',
+                description,
+                30)
+
+        # An alternative way of doing DRY serialization would be to
+        # create a custom class that inherits from falcon.Request. This
+        # class could, for example, have an additional 'doc' property
+        # that would serialize to JSON under the covers.
+        req.context['result'] = result
+
+        resp.set_header('X-Powered-By', 'Small Furry Creatures')
+        resp.status = falcon.HTTP_200
+
+    @falcon.before(max_body(64 * 1024))
+    def on_post(self, req, resp, user_id):
+        try:
+            doc = req.context['doc']
+        except KeyError:
+            raise falcon.HTTPBadRequest(
+                'Missing thing',
+                'A thing must be submitted in the request body.')
+
+        proper_thing = self.db.add_thing(doc)
+
+        resp.status = falcon.HTTP_201
+        resp.location = '/%s/things/%s' % (user_id, proper_thing['id'])
+
+
+# Configure your WSGI server to load "things.app" (app is a WSGI callable)
+app = falcon.API(middleware=[
+    AuthMiddleware(),
+    RequireJSON(),
+    JSONTranslator(),
+])
+
+db = StorageEngine()
+things = ThingsResource(db)
+app.add_route('/{user_id}/things', things)
+
+# If a responder ever raised an instance of StorageError, pass control to
+# the given handler.
+app.add_error_handler(StorageError, StorageError.handle)
+
+# Proxy some things to another service; this example shows how you might
+# send parts of an API off to a legacy system that hasn't been upgraded
+# yet, or perhaps is a single cluster that all data centers have to share.
+sink = SinkAdapter()
+app.add_sink(sink, r'/search/(?P<engine>ddg|y)\Z')
+
+# Useful for debugging problems in your API; works with pdb.set_trace()
+if __name__ == '__main__':
+    httpd = simple_server.make_server('127.0.0.1', 8000, app)
+    httpd.serve_forever()
